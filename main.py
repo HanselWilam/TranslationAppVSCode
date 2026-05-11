@@ -1,208 +1,168 @@
 import asyncio
 import io
 import json
-import threading
-from functools import lru_cache
-from typing import Dict, List, Tuple
+import time
+from typing import List
 
 import numpy as np
-import torch
+import re
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from PIL import Image
-from rapidocr_onnxruntime import RapidOCR
-from transformers import MarianMTModel, MarianTokenizer
+from rapidocr import OCRVersion, RapidOCR
+from deep_translator import GoogleTranslator
+# from transformers import MarianMTModel, MarianTokenizer
 
 app = FastAPI()
-ocr = RapidOCR()
+ocr = RapidOCR(
+    params={
+        "Det.ocr_version": OCRVersion.PPOCRV5,
+        "Rec.ocr_version": OCRVersion.PPOCRV5,
+        "Cls.ocr_version": OCRVersion.PPOCRV5,
+    }
+)
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEFAULT_SOURCE_LANGUAGE = "ja"
+DEFAULT_TARGET_LANGUAGE = "id"
 
-DEFAULT_SOURCE_LANG = "ja"
-DEFAULT_TARGET_LANG = "en"
-
-SUPPORTED_LANGS = {
+SUPPORTED_LANGUAGES = {
     "en": "English",
     "ja": "Japanese",
-    "zh": "Chinese",
+    "zh": "Chinese (Simplified)",
     "id": "Bahasa Indonesia",
 }
 
-DIRECT_MODEL_IDS: Dict[Tuple[str, str], str] = {
-    ("ja", "en"): "Helsinki-NLP/opus-mt-ja-en",
-    ("en", "ja"): "Helsinki-NLP/opus-mt-en-jap",
-    ("zh", "en"): "Helsinki-NLP/opus-mt-zh-en",
-    ("en", "zh"): "Helsinki-NLP/opus-mt-en-zh",
-    ("id", "en"): "Helsinki-NLP/opus-mt-id-en",
-    ("en", "id"): "Helsinki-NLP/opus-mt-en-id",
-}
-
-TRANSLATION_CACHE: Dict[Tuple[str, str, str], str] = {}
-TRANSLATION_CACHE_LOCK = threading.Lock()
-
-
 def normalize_lang(lang: str) -> str:
     value = (lang or "").strip().lower()
+    return value if value in SUPPORTED_LANGUAGES else DEFAULT_SOURCE_LANGUAGE
 
-    if value not in SUPPORTED_LANGS:
-        raise ValueError(f"Unsupported language code: {lang}")
-
-    return value
-
-
-def resolve_steps(source_lang: str, target_lang: str) -> List[Tuple[str, str]]:
-    source_lang = normalize_lang(source_lang)
-    target_lang = normalize_lang(target_lang)
-
-    if source_lang == target_lang:
-        return []
-
-    if (source_lang, target_lang) in DIRECT_MODEL_IDS:
-        return [(source_lang, target_lang)]
-
-    # Translate to English first
-    if source_lang != "en" and target_lang != "en":
-        return [(source_lang, "en"), ("en", target_lang)]
-
-    raise ValueError(f"No Marian route configured for {source_lang} -> {target_lang}")
-
-
-@lru_cache(maxsize=8)
-def load_model(model_id: str):
-    tokenizer = MarianTokenizer.from_pretrained(model_id)
-    model = MarianMTModel.from_pretrained(model_id)
-    model.to(DEVICE)
-    model.eval()
-    return tokenizer, model
-
-
-def translate_step_batch(texts: List[str], source_lang: str, target_lang: str) -> List[str]:
+def batch_translate(texts: List[str], source_lang: str, target_lang: str) -> List[str]:
     if not texts:
         return []
-
-    model_id = DIRECT_MODEL_IDS[(source_lang, target_lang)]
-    tokenizer, model = load_model(model_id)
-
-    inputs = tokenizer(
-        texts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-    )
-    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
-
-    with torch.inference_mode():
-        outputs = model.generate(
-            **inputs,
-            num_beams=1,
-            max_new_tokens=128,
-        )
-
-    return [tokenizer.decode(output, skip_special_tokens=True).strip() for output in outputs]
-
-
-def translate_pipeline(texts: List[str], source_lang: str, target_lang: str) -> List[str]:
-    steps = resolve_steps(source_lang, target_lang)
-    if not steps:
-        return texts
-
-    current_texts = texts
-    for step_source, step_target in steps:
-        current_texts = translate_step_batch(current_texts, step_source, step_target)
-    return current_texts
-
-
-def translate_texts_with_cache(texts: List[str], source_lang: str, target_lang: str) -> List[str]:
-    source_lang = normalize_lang(source_lang)
-    target_lang = normalize_lang(target_lang)
-
+    
     if source_lang == target_lang:
         return texts
 
-    final_results: List[str] = [""] * len(texts)
-    pending_indices: List[int] = []
-    pending_texts: List[str] = []
+    google_codes = {
+        "en": "en",
+        "ja": "ja",
+        "zh": "zh-CN",
+        "id": "id"
+    }
+    g_source = google_codes.get(source_lang, "auto")
+    g_target = google_codes.get(target_lang, "id")
 
-    for idx, raw_text in enumerate(texts):
-        text = (raw_text or "").strip()
-        if not text:
-            final_results[idx] = ""
-            continue
+    translator = GoogleTranslator(g_source, g_target)
+    
+    # Batch texts using a unique delimiter to prevent Google rate limits
+    delimiter = " | "
+    chunk_size = 8
+    final_translations = []
+    
+    for i in range(0, len(texts), chunk_size):
+        chunk = texts[i:i + chunk_size]
+        combined_text = delimiter.join(chunk)
+        
+        try:
+            translated_combined = translator.translate(combined_text)
+            translated_list = [t.strip() for t in translated_combined.split(delimiter)]
+            
+            if len(translated_list) != len(chunk):
+                # Fallback for current chunk
+                final_translations.extend([translator.translate(t) for t in chunk])
+            else:
+                final_translations.extend(translated_list)
+        except Exception:
+            final_translations.extend([""] * len(chunk))
 
-        cache_key = (source_lang, target_lang, text)
-        with TRANSLATION_CACHE_LOCK:
-            cached = TRANSLATION_CACHE.get(cache_key)
+    return final_translations
 
-        if cached is not None:
-            final_results[idx] = cached
-        else:
-            pending_indices.append(idx)
-            pending_texts.append(text)
-
-    if pending_texts:
-        translated_pending = translate_pipeline(pending_texts, source_lang, target_lang)
-
-        for idx, original_text, translated_text in zip(pending_indices, pending_texts, translated_pending):
-            final_results[idx] = translated_text
-            cache_key = (source_lang, target_lang, original_text)
-            with TRANSLATION_CACHE_LOCK:
-                TRANSLATION_CACHE[cache_key] = translated_text
-
-    return final_results
-
-
-def process_image_bytes(image_bytes: bytes, source_lang: str, target_lang: str):
+def process_image_bytes(image_bytes: bytes, source_lang: str, target_lang: str, include_metrics: bool = False):
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     img_array = np.array(image)
 
-    result, _ = ocr(img_array)
+    ocr_start = time.time()
+    res = ocr(img_array)
+    ocr_time = time.time() - ocr_start
 
-    if not result:
-        return []
+    if res.boxes is None or res.txts is None:
+        return {"data": [], "metrics": {}} if include_metrics else []
 
     boxes = []
     texts = []
+    scores = []
+    needs_translation_flags = []
 
-    for r in result:
-        box = r[0]
-        text = str(r[1])
+    for box, text, score in zip(res.boxes, res.txts, res.scores):
+        text = str(text).strip()
 
+        # Remove non-alphanumeric characters
+        text = re.sub(r'[^\w\s\u3040-\u309f\u30a0-\u30ff\u4e00-\u9faf！？。、,.!?]', '', text)
+        
         try:
-            score = float(r[2])
-        except:
+            score = float(score)
+        except ValueError:
             score = 0.0
 
-        if score > 0.60 and len(text.strip()) > 1:
+        # y_coords = [pt[1] for pt in box]
+        # box_height = max(y_coords) - min(y_coords)
+
+        if score > 0.40 and len(text) > 0:
             boxes.append([[float(c) for c in pt] for pt in box])
             texts.append(text)
+            scores.append(score)
+
+            if text.isnumeric() or (text.isascii() and len(text) <= 2):
+                needs_translation_flags.append(False)
+            else:
+                needs_translation_flags.append(True)
 
     if not texts:
-        return []
+        return {"data": [], "metrics": {}} if include_metrics else []
+    
+    texts_to_translate = [t for t, flag in zip(texts, needs_translation_flags) if flag]
 
-    translated_list = translate_texts_with_cache(texts, source_lang, target_lang)
-    print("OCR RESULT:", result)
-    print("TEXTS:", texts)
-    print("SOURCE:", source_lang, "TARGET:", target_lang)
-    print("TRANSLATED:", translated_list)
+    trans_start = time.time()
+    translated_subset = batch_translate(texts_to_translate, source_lang, target_lang)
+    trans_time = time.time() - trans_start
+
+    final_translations = []
+    index = 0
+    for text, flag in zip(texts, needs_translation_flags):
+        if flag and index < len(translated_subset):
+            final_translations.append(translated_subset[index])
+            index += 1
+        else:
+            final_translations.append(text)
 
     output = [
         {
             "box": box,
             "sourceText": src_text,
             "translated": translated_text,
+            "ocrScore": round(score, 4)
         }
-        for box, src_text, translated_text in zip(boxes, texts, translated_list)
+        for box, src_text, translated_text, score in zip(boxes, texts, final_translations, scores)
+        if translated_text # Drop empty translations
     ]
 
+    if include_metrics:
+        return {
+            "data": output,
+            "metrics": {
+                "ocr_latency_sec": round(ocr_time, 4),
+                "translation_latency_sec": round(trans_time, 4),
+                "total_text_blocks": len(texts)
+            }
+        }
     return output
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
-
     state = {
-        "sourceLang": DEFAULT_SOURCE_LANG,
-        "targetLang": DEFAULT_TARGET_LANG,
+        "sourceLang": DEFAULT_SOURCE_LANGUAGE,
+        "targetLang": DEFAULT_TARGET_LANGUAGE,
     }
 
     try:
@@ -212,54 +172,32 @@ async def websocket_endpoint(ws: WebSocket):
             if message.get("text") is not None:
                 try:
                     payload = json.loads(message["text"])
+                    if payload.get("type") == "language_pair":
+                        state["sourceLang"] = normalize_lang(payload.get("sourceLang"))
+                        state["targetLang"] = normalize_lang(payload.get("targetLang"))
+                        await ws.send_json({"type": "language_ack", **state})
                 except Exception:
-                    continue
-
-                if payload.get("type") == "language_pair":
-                    try:
-                        state["sourceLang"] = normalize_lang(payload.get("sourceLang", DEFAULT_SOURCE_LANG))
-                        state["targetLang"] = normalize_lang(payload.get("targetLang", DEFAULT_TARGET_LANG))
-                        await ws.send_json({
-                            "type": "language_ack",
-                            "sourceLang": state["sourceLang"],
-                            "targetLang": state["targetLang"],
-                        })
-                    except Exception as e:
-                        await ws.send_json({
-                            "type": "error",
-                            "message": str(e),
-                        })
+                    pass
                 continue
 
             if message.get("bytes") is not None:
-                data = message["bytes"]
                 loop = asyncio.get_running_loop()
                 output = await loop.run_in_executor(
-                    None,
-                    process_image_bytes,
-                    data,
-                    state["sourceLang"],
-                    state["targetLang"],
+                    None, process_image_bytes, message["bytes"], state["sourceLang"], state["targetLang"]
                 )
                 await ws.send_json(output)
 
     except WebSocketDisconnect:
         return
-    except Exception as e:
-        print(f"Error: {e}")
-        try:
-            await ws.send_json([])
-        except Exception:
-            pass
     
 @app.post("/test-image")
 async def test_image(file: UploadFile = File(...)):
     data = await file.read()
-
     output = process_image_bytes(
         data,
-        DEFAULT_SOURCE_LANG,
-        DEFAULT_TARGET_LANG
+        DEFAULT_SOURCE_LANGUAGE,
+        DEFAULT_TARGET_LANGUAGE,
+        include_metrics=True
     )
-    
+
     return output
