@@ -34,22 +34,33 @@ DEFAULT_SOURCE_LANGUAGE = "ja"
 DEFAULT_TARGET_LANGUAGE = "id"
 
 TEST_MAX_IMAGE_SIDE = 2560
-LIVE_MAX_IMAGE_SIDE = 1280
+LIVE_MAX_IMAGE_SIDE = 1920
 
 TRANSLATION_CACHE = {}
 TRANSLATION_CACHE_LOCK = threading.Lock()
 MAX_TRANSLATION_WORKERS = 4
 
-LANG_CODE_MAPS = {
-    "google": {"en": "en", "ja": "ja", "zh": "zh-CN", "id": "id"},
-    "azure": {"en": "en", "ja": "ja", "zh": "zh-Hans", "id": "id"},
-    "libre": {"en": "en", "ja": "ja", "zh": "zh", "id": "id"},
+LANG_CODE_MAP = {
+    "google": {
+        "en": "en", "ja": "ja", "zh": "zh-CN", "id": "id",
+        "ko": "ko", "ru": "ru", "es": "es", "fr": "fr", "de": "de"
+    },
+    "azure": {
+        "en": "en", "ja": "ja", "zh": "zh-Hans", "id": "id",
+        "ko": "ko",  "ru": "ru", "es": "es", "fr": "fr", "de": "de"
+    },
+    "libre": {
+        "en": "en", "ja": "ja", "zh": "zh", "id": "id",
+        "ko": "ko",  "ru": "ru", "es": "es", "fr": "fr", "de": "de"
+    },
 }
 
 SOURCE_SCRIPT_RE = {
     "ja": re.compile(r"[\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff]"),
     "zh": re.compile(r"[\u4e00-\u9fff]"),
-    "en": re.compile(r"[A-Za-z]")
+    "ko": re.compile(r"[\uac00-\ud7af\u1100-\u11ff\u3130-\u318f]"),
+    "ru": re.compile(r"[\u0400-\u04ff]"),
+    "latin": re.compile(r"[A-Za-z\u00C0-\u024F\u1E00-\u1EFF]")
 }
 
 NOISE_TOKENS = {
@@ -78,13 +89,13 @@ class TranslateRequest(BaseModel):
 
 def normalize_lang(lang: str) -> str:
     value = (lang or "").strip().lower()
-    return value if value in LANG_CODE_MAPS["google"] else DEFAULT_SOURCE_LANGUAGE
+    return value if value in LANG_CODE_MAP["google"] else DEFAULT_SOURCE_LANGUAGE
 
 def normalize_ocr_text(text: str) -> str:
     text = (text or "").strip()
     text = re.sub(r"\s+", " ", text)
     text = re.sub(
-        r"[^\w\s\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff！？。、,.!?\'\"():・\-—「」『』（）【】：]",
+        r"[^\w\s\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff\uac00-\ud7af\u1100-\u11ff\u3130-\u318f\u0400-\u04ff\u00C0-\u024F！？。、,.!?\'\"():・\-—「」『』（）【】：]",
         "",
         text,
     )
@@ -93,7 +104,7 @@ def normalize_ocr_text(text: str) -> str:
 def should_keep_text(text: str, score: float, source_lang: str) -> bool:
     text = normalize_ocr_text(text)
 
-    if score < 0.70 or len(text) <= 1:
+    if score < 0.75 or len(text) <= 1:
         return False
     if text.isnumeric() or text.lower() in NOISE_TOKENS:
         return False
@@ -104,7 +115,13 @@ def should_keep_text(text: str, score: float, source_lang: str) -> bool:
 
     if source_lang == "ja" and not SOURCE_SCRIPT_RE["ja"].search(text):
         return False
-    if source_lang == "zh" and not SOURCE_SCRIPT_RE["zh"].search(text):
+    if source_lang in {"zh", "zh-CN", "zh-Hans", "zh-TW"} and not SOURCE_SCRIPT_RE["zh"].search(text):
+        return False
+    if source_lang == "ko" and not SOURCE_SCRIPT_RE["ko"].search(text):
+        return False
+    if source_lang == "ru" and not SOURCE_SCRIPT_RE["ru"].search(text):
+        return False
+    if source_lang in {"en", "id", "es", "fr", "de"} and not SOURCE_SCRIPT_RE["latin"].search(text):
         return False
 
     return True
@@ -164,7 +181,10 @@ def merge_group_box(group):
         [min(xs), max(ys)],
     ]
 
-def sort_group_blocks(items, y_threshold=18.0, x_gap_threshold=90.0):
+def sort_group_blocks(items, source_lang: str, y_threshold_factor=0.7, x_gap_factor=2.5):
+    if not items:
+        return []
+
     items = sorted(items, key=lambda x: (center_y(x["box"]), x["box"][0][0]))
     grouped = []
 
@@ -178,8 +198,12 @@ def sort_group_blocks(items, y_threshold=18.0, x_gap_threshold=90.0):
         last_right = max(pt[0] for x in last_group for pt in x["box"])
         item_left = min(pt[0] for pt in item["box"])
 
-        same_row = abs(center_y(item["box"]) - last_y) <= y_threshold
-        close_x = (item_left - last_right) <= x_gap_threshold
+        current_height = box_height(item["box"])
+        dynamic_y_thresh = current_height * y_threshold_factor
+        dynamic_x_gap = current_height * x_gap_factor
+
+        same_row = abs(center_y(item["box"]) - last_y) <= dynamic_y_thresh
+        close_x = (item_left - last_right) <= dynamic_x_gap
 
         if same_row and close_x:
             last_group.append(item)
@@ -187,9 +211,11 @@ def sort_group_blocks(items, y_threshold=18.0, x_gap_threshold=90.0):
             grouped.append([item])
 
     merged = []
+    join_char = "" if source_lang in {"ja", "zh", "zh-CN", "zh-Hans", "zh-TW"} else " "
+
     for group in grouped:
         group = sorted(group, key=lambda x: x["box"][0][0])
-        merged_text = " ".join(x["text"] for x in group).strip()
+        merged_text = join_char.join(x["text"] for x in group).strip()
         merged_score = min(x["ocrScore"] for x in group)
 
         merged.append({
@@ -214,7 +240,7 @@ def load_debug_font(size: int):
     return ImageFont.load_default()
 
 def get_lang_code(backend: str, lang: str, default: str = "auto") -> str:
-    return LANG_CODE_MAPS.get(backend, {}).get(lang, default)
+    return LANG_CODE_MAP.get(backend, {}).get(lang, default)
 
 def wrap_text(text: str, width: int = 28) -> str:
     text = text or ""
@@ -238,7 +264,6 @@ def translate_google(texts: List[str], source_lang: str, target_lang: str) -> Li
 
     src_code = get_lang_code("google", source_lang)
     tgt_code = get_lang_code("google", target_lang)
-    translator = GoogleTranslator(source=src_code, target=tgt_code)
 
     def _translate_single(text: str) -> str:
         cleaned = normalize_ocr_text(text)
@@ -250,7 +275,8 @@ def translate_google(texts: List[str], source_lang: str, target_lang: str) -> Li
             return cached
 
         try:
-            translated = (translator.translate(cleaned) or "").strip()
+            local_translator = GoogleTranslator(source=src_code, target=tgt_code)
+            translated = (local_translator.translate(cleaned) or "").strip()
         except Exception:
             translated = cleaned
 
@@ -403,7 +429,7 @@ def process_image_bytes(
     if not raw_items:
         return {"data": [], "metrics": {}} if include_metrics else []
     
-    grouped_items = sort_group_blocks(raw_items)
+    grouped_items = sort_group_blocks(raw_items, source_lang)
     texts_to_translate = [item["text"] for item in grouped_items]
 
     trans_start = time.time()
