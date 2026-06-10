@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import io
 import json
 import os
@@ -8,12 +7,15 @@ import time
 import threading
 import requests
 import numpy as np
+import sacrebleu
+import jiwer
 
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor
 from typing import List
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi import Form
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from PIL import Image, ImageDraw, ImageFont
@@ -34,7 +36,7 @@ DEFAULT_SOURCE_LANGUAGE = "ja"
 DEFAULT_TARGET_LANGUAGE = "id"
 
 TEST_MAX_IMAGE_SIDE = 2560
-LIVE_MAX_IMAGE_SIDE = 1920
+LIVE_MAX_IMAGE_SIDE = 2240
 
 TRANSLATION_CACHE = {}
 TRANSLATION_CACHE_LOCK = threading.Lock()
@@ -72,7 +74,7 @@ NOISE_TOKENS = {
 
 load_dotenv()
 
-LIVE_TRANSLATION_BACKEND = os.getenv("LIVE_TRANSLATION_BACKEND", "google").lower()
+LIVE_TRANSLATION_BACKEND = os.getenv("TRANSLATION_BACKEND", "google").lower()
 
 LIBRETRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "http://localhost:5000")
 LIBRETRANSLATE_API_KEY = os.getenv("LIBRETRANSLATE_API_KEY", "")
@@ -171,7 +173,7 @@ def box_height(box) -> float:
 def center_y(box) -> float:
     return sum(pt[1] for pt in box) / len(box)
 
-def merge_group_box(group):
+def calculate_bounding_box(group):
     xs = [pt[0] for item in group for pt in item["box"]]
     ys = [pt[1] for item in group for pt in item["box"]]
     return [
@@ -181,49 +183,87 @@ def merge_group_box(group):
         [min(xs), max(ys)],
     ]
 
-def sort_group_blocks(items, source_lang: str, y_threshold_factor=0.7, x_gap_factor=2.5):
+def merge_into_paragraphs(items, source_lang: str, y_threshold_factor=0.7, x_gap_factor=2.5):
     if not items:
         return []
-
-    items = sorted(items, key=lambda x: (center_y(x["box"]), x["box"][0][0]))
-    grouped = []
+    
+    list_pattern = re.compile(r"^(\d+[\)\.]|ex\.|・|-|\*)")
 
     for item in items:
-        if not grouped:
-            grouped.append([item])
-            continue
+        box = item["box"]
+        item["top"] = min(pt[1] for pt in box)
+        item["bottom"] = max(pt[1] for pt in box)
+        item["left"] = min(pt[0] for pt in box)
+        item["right"] = max(pt[0] for pt in box)
+        item["height"] = item["bottom"] - item["top"]
+        item["center_y"] = (item["top"] + item["bottom"]) / 2
 
-        last_group = grouped[-1]
-        last_y = sum(center_y(x["box"]) for x in last_group) / len(last_group)
-        last_right = max(pt[0] for x in last_group for pt in x["box"])
-        item_left = min(pt[0] for pt in item["box"])
+    sorted_items = sorted(items, key=lambda x: (x["top"], x["left"]))
 
-        current_height = box_height(item["box"])
-        dynamic_y_thresh = current_height * y_threshold_factor
-        dynamic_x_gap = current_height * x_gap_factor
+    blocks = []
+    for item in sorted_items:
+        placed = False
+        is_list_item = bool(list_pattern.match(item["text"].strip()))
 
-        same_row = abs(center_y(item["box"]) - last_y) <= dynamic_y_thresh
-        close_x = (item_left - last_right) <= dynamic_x_gap
+        for block in blocks:
+            last_item = block[-1]
+            
+            # Similar font heights means in the same paragraph
+            avg_height = sum(x["height"] for x in block) / len(block)
+            if not (0.5 <= item["height"] / max(1, avg_height) <= 2.0):
+                continue
 
-        if same_row and close_x:
-            last_group.append(item)
-        else:
-            grouped.append([item])
+            # Horizontal Proximity
+            is_same_line = abs(item["center_y"] - last_item["center_y"]) < (avg_height * 0.5)
+            x_gap = item["left"] - last_item["right"]
+            is_close_horizontally = is_same_line and (0 <= x_gap <= avg_height * 2.5)
 
+            # Vertical Alignment
+            y_gap = item["top"] - last_item["bottom"]
+            is_close_vertically = -avg_height <= y_gap <= (avg_height * 1.0)
+            
+            block_left = min(x["left"] for x in block)
+            block_right = max(x["right"] for x in block)
+            overlap_x = max(0, min(block_right, item["right"]) - max(block_left, item["left"]))
+            min_width = min((block_right - block_left), (item["right"] - item["left"]))
+            
+            is_aligned = (overlap_x > min_width * 0.3) or (abs(item["left"] - block_left) < avg_height)
+
+            if is_list_item and not is_same_line:
+                is_vertically_stacked = False
+            else:
+                is_vertically_stacked = is_close_vertically and is_aligned
+
+            if is_close_horizontally or is_vertically_stacked:
+                block.append(item)
+                placed = True
+                break
+        
+        if not placed:
+            blocks.append([item])
+    
     merged = []
     join_char = "" if source_lang in {"ja", "zh", "zh-CN", "zh-Hans", "zh-TW"} else " "
 
-    for group in grouped:
-        group = sorted(group, key=lambda x: x["box"][0][0])
-        merged_text = join_char.join(x["text"] for x in group).strip()
-        merged_score = min(x["ocrScore"] for x in group)
+    for block in blocks:
+        block_avg_height = sum(x["height"] for x in block) / max(1, len(block))
+        y_bucket_step = max(1, block_avg_height * 0.5)
+
+        block.sort(key=lambda x: (x["center_y"] // y_bucket_step, x["left"]))
+        
+        merged_text = join_char.join(x["text"] for x in block).strip()
+        merged_score = min(x["ocrScore"] for x in block)
+
+        for k in ["top", "bottom", "left", "right", "height", "center_y"]:
+            for x in block:
+                x.pop(k, None)
 
         merged.append({
-            "box": merge_group_box(group),
+            "box": calculate_bounding_box(block),
             "text": merged_text,
             "ocrScore": merged_score,
         })
-
+    
     return merged
 
 def load_debug_font(size: int):
@@ -380,6 +420,12 @@ def translate_libre(texts: List[str], source_lang: str, target_lang: str) -> Lis
         return list(pool.map(_translate_single, texts))
 
 def translate_many(texts: List[str], source_lang: str, target_lang: str, backend: str | None = None) -> List[str]:
+    if not texts:
+        return []
+    
+    if source_lang.strip().lower() == target_lang.strip().lower():
+        return texts
+    
     backend = (backend or LIVE_TRANSLATION_BACKEND).lower()
     if backend not in {"google", "azure", "libre"}:
         backend = "google"
@@ -417,7 +463,8 @@ def process_image_bytes(
         if not should_keep_text(text, score, source_lang):
             continue
 
-        if box_height(box) < 16 and len(text) <= 3:
+        is_punctuation = bool(re.fullmatch(r"[！？。、,.!?]+", text))
+        if box_height(box) < 16 and len(text) <= 3 and not is_punctuation:
             continue
 
         raw_items.append({
@@ -429,8 +476,18 @@ def process_image_bytes(
     if not raw_items:
         return {"data": [], "metrics": {}} if include_metrics else []
     
-    grouped_items = sort_group_blocks(raw_items, source_lang)
+    print("\n" + "="*50)
+    print("RAW OCR DETECTIONS:")
+    for item in raw_items:
+         print(f"  [{item['ocrScore']:.4f}] {item['text']}")
+    
+    grouped_items = merge_into_paragraphs(raw_items, source_lang)
     texts_to_translate = [item["text"] for item in grouped_items]
+
+    print("\nMERGED PARAGRAPHS (SENT TO API):")
+    for idx, text in enumerate(texts_to_translate):
+         print(f"  Block {idx + 1}: {text}")
+    print("="*50 + "\n")
 
     trans_start = time.time()
     translations = translate_many(texts_to_translate, source_lang, target_lang, backend)
@@ -485,6 +542,7 @@ async def websocket_endpoint(ws: WebSocket):
 
             if message.get("bytes") is not None:
                 image_bytes = message["bytes"]
+                print(f"Live Translation Backend: {LIVE_TRANSLATION_BACKEND}")
                 
                 loop = asyncio.get_running_loop()
                 func = partial(
@@ -631,4 +689,59 @@ async def test_image_translate(
         "source_lang": source_lang,
         "target_lang": target_lang,
         "items": output,
+    }
+
+@app.post("/analyze-image")
+async def analyze_image(
+    file: UploadFile = File(...),
+    ground_truth_ocr: str = Form(...),
+    ground_truth_translation: str = Form(...),
+    source_lang: str = Form(DEFAULT_SOURCE_LANGUAGE),
+    target_lang: str = Form(DEFAULT_TARGET_LANGUAGE),
+    backend: str = Form("google")
+):
+    data = await file.read()
+
+    result = process_image_bytes(
+        image_bytes=data,
+        source_lang=source_lang,
+        target_lang=target_lang,
+        include_metrics=True,
+        max_image_side=TEST_MAX_IMAGE_SIDE,
+        backend=backend
+    )
+
+    pipeline_data = result.get("data", [])
+    pipeline_metrics = result.get("metrics", {})
+
+    predicted_ocr = " ".join([item["text"] for item in pipeline_data]).strip()
+    predicted_translation = " ".join([item["translated"] for item in pipeline_data]).strip()
+
+    # Character Error Rate (CER) - Lower is better
+    try:
+        cer_score = jiwer.cer(ground_truth_ocr, predicted_ocr)
+    except Exception:
+        cer_score = 1.0
+
+    # BLEU Score - Higher is better
+    try:
+        bleu = sacrebleu.corpus_bleu([predicted_translation], [[ground_truth_translation]])
+        bleu_score = bleu.score
+    except Exception:
+        bleu_score = 0.0
+
+    return {
+        "latency_metrics": {
+            "ocr_processing_sec": pipeline_metrics.get("ocr_latency_sec", 0),
+            "translation_api_sec": pipeline_metrics.get("translation_latency_sec", 0),
+            "total_pipeline_sec": round(pipeline_metrics.get("ocr_latency_sec", 0) + pipeline_metrics.get("translation_latency_sec", 0), 4)
+        },
+        "accuracy_metrics": {
+            "cer_score": round(cer_score, 4),
+            "bleu_score": round(bleu_score, 2)
+        },
+        "debug_output": {
+            "predicted_ocr": predicted_ocr,
+            "predicted_translation": predicted_translation
+        }
     }
