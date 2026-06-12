@@ -183,11 +183,11 @@ def calculate_bounding_box(group):
         [min(xs), max(ys)],
     ]
 
-def merge_into_paragraphs(items, source_lang: str, y_threshold_factor=0.7, x_gap_factor=2.5):
+def merge_into_paragraphs(items, source_lang: str):
     if not items:
         return []
     
-    list_pattern = re.compile(r"^(\d+[\)\.]|ex\.|・|-|\*)")
+    list_pattern = re.compile(r"^(\d+[\)\.]|[a-zA-Z][\)\.]|[ivxIVX]+[\)\.]|ex\.|・|-|\*|[①-⑳])")
 
     for item in items:
         box = item["box"]
@@ -216,7 +216,7 @@ def merge_into_paragraphs(items, source_lang: str, y_threshold_factor=0.7, x_gap
             # Horizontal Proximity
             is_same_line = abs(item["center_y"] - last_item["center_y"]) < (avg_height * 0.5)
             x_gap = item["left"] - last_item["right"]
-            is_close_horizontally = is_same_line and (0 <= x_gap <= avg_height * 2.5)
+            is_close_horizontally = is_same_line and (0 <= x_gap <= avg_height * 1.2)
 
             # Vertical Alignment
             y_gap = item["top"] - last_item["bottom"]
@@ -251,7 +251,21 @@ def merge_into_paragraphs(items, source_lang: str, y_threshold_factor=0.7, x_gap
 
         block.sort(key=lambda x: (x["center_y"] // y_bucket_step, x["left"]))
         
-        merged_text = join_char.join(x["text"] for x in block).strip()
+        merged_text = ""
+        for i, x in enumerate(block):
+            text_val = x["text"].strip()
+            is_dialogue = bool(re.match(r"^([A-Za-z0-9\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]{1,7}[:：]|「)", text_val))
+            
+            if i > 0:
+                prev = block[i-1]
+                if abs(x["center_y"] - prev["center_y"]) > block_avg_height * 0.5 or is_dialogue:
+                    if not merged_text.endswith("\n"):
+                        merged_text += "\n"
+                else:
+                    merged_text += join_char
+            merged_text += x["text"]
+            
+        merged_text = merged_text.strip()
         merged_score = min(x["ocrScore"] for x in block)
 
         for k in ["top", "bottom", "left", "right", "height", "center_y"]:
@@ -263,7 +277,7 @@ def merge_into_paragraphs(items, source_lang: str, y_threshold_factor=0.7, x_gap
             "text": merged_text,
             "ocrScore": merged_score,
         })
-    
+
     return merged
 
 def load_debug_font(size: int):
@@ -723,12 +737,12 @@ async def analyze_image(
     except Exception:
         cer_score = 1.0
 
-    # BLEU Score - Higher is better
+    # CHRF Score - Higher is better
     try:
-        bleu = sacrebleu.corpus_bleu([predicted_translation], [[ground_truth_translation]])
-        bleu_score = bleu.score
+        chrf = sacrebleu.corpus_chrf([predicted_translation], [[ground_truth_translation]])
+        translation_score = chrf.score
     except Exception:
-        bleu_score = 0.0
+        translation_score = 0.0
 
     return {
         "latency_metrics": {
@@ -738,7 +752,7 @@ async def analyze_image(
         },
         "accuracy_metrics": {
             "cer_score": round(cer_score, 4),
-            "bleu_score": round(bleu_score, 2)
+            "chrf_score": round(translation_score, 2)
         },
         "debug_output": {
             "predicted_ocr": predicted_ocr,
