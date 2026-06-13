@@ -303,14 +303,16 @@ def wrap_text(text: str, width: int = 28) -> str:
     return "\n".join(text[i:i + width] for i in range(0, len(text), width))
 
 def cache_get(backend: str, source_lang: str, target_lang: str, text: str):
-    key = (backend, source_lang, target_lang, text)
-    with TRANSLATION_CACHE_LOCK:
-        return TRANSLATION_CACHE.get(key)
+    return None
+    # key = (backend, source_lang, target_lang, text)
+    # with TRANSLATION_CACHE_LOCK:
+    #     return TRANSLATION_CACHE.get(key)
 
 def cache_set(backend: str, source_lang: str, target_lang: str, text: str, translated: str):
-    key = (backend, source_lang, target_lang, text)
-    with TRANSLATION_CACHE_LOCK:
-        TRANSLATION_CACHE[key] = translated
+    return
+    # key = (backend, source_lang, target_lang, text)
+    # with TRANSLATION_CACHE_LOCK:
+    #     TRANSLATION_CACHE[key] = translated
 
 def translate_google(texts: List[str], source_lang: str, target_lang: str) -> List[str]:
     if not texts:
@@ -721,7 +723,7 @@ async def analyze_image(
         source_lang=source_lang,
         target_lang=target_lang,
         include_metrics=True,
-        max_image_side=TEST_MAX_IMAGE_SIDE,
+        max_image_side=LIVE_MAX_IMAGE_SIDE,
         backend=backend
     )
 
@@ -731,15 +733,21 @@ async def analyze_image(
     predicted_ocr = " ".join([item["text"] for item in pipeline_data]).strip()
     predicted_translation = " ".join([item["translated"] for item in pipeline_data]).strip()
 
+    normalized_ground_truth_ocr = ground_truth_ocr.replace(" ", "").replace("\n", "")
+    normalized_predicted_ocr = predicted_ocr.replace(" ", "").replace("\n", "")
+
+    normalized_ground_truth_translation = " ".join(ground_truth_translation.replace("\n", " ").split())
+    normalized_predicted_translation = " ".join(predicted_translation.replace("\n", " ").split())
+
     # Character Error Rate (CER) - Lower is better
     try:
-        cer_score = jiwer.cer(ground_truth_ocr, predicted_ocr)
+        cer_score = jiwer.cer(normalized_ground_truth_ocr, normalized_predicted_ocr)
     except Exception:
         cer_score = 1.0
 
     # CHRF Score - Higher is better
     try:
-        chrf = sacrebleu.corpus_chrf([predicted_translation], [[ground_truth_translation]])
+        chrf = sacrebleu.corpus_chrf([normalized_predicted_translation], [[normalized_ground_truth_translation]])
         translation_score = chrf.score
     except Exception:
         translation_score = 0.0
